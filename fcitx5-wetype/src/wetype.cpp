@@ -115,11 +115,11 @@ static std::string segmentPinyin(const std::string &raw) {
             }
         }
         if (match) {
-            if (!out.empty() && out.back() != '\'' && out.back() != ' ') out += ' ';
+            if (!out.empty() && out.back() != '\'') out += '\'';
             out.append(raw, i, match);
             i += match;
         } else {
-            if (!out.empty() && out.back() != '\'' && out.back() != ' ') out += ' ';
+            if (!out.empty() && out.back() != '\'') out += '\'';
             out.append(raw, i, std::string::npos);
             break;
         }
@@ -133,7 +133,7 @@ static Text pinyinPreedit(const std::string &buffer, bool doublePin) {
     if (doublePin) {
         // 双拼编码每两键一个音节；不按全拼词表切分，也不改动引擎输入。
         for (size_t i = 0; i < buffer.size(); i += 2) {
-            if (i) display += ' ';
+            if (i) display += '\'';
             display.append(buffer, i, 2);
         }
     } else {
