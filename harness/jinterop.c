@@ -306,7 +306,7 @@ static pthread_mutex_t g_cand_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cand_cv = PTHREAD_COND_INITIALIZER;
 static unsigned long g_cand_callback_count = 0;
 /* 候选事件队列：引擎异步搜索，一次 B 可能先收到旧输入的候选。每个事件带上
- * 同批 PendingInput.match 拼出的输入串，daemon 只回复与已发送按键一致的那个。 */
+ * 同批 PendingInput 还原的原始按键，daemon 只立即回复与已发送按键一致的那个。 */
 #define CAND_QUEUE 32
 typedef struct { long it, sid; uint32_t version; int known; char input[256]; } CandEvent;
 static CandEvent g_cloud_q[CAND_QUEUE];
@@ -326,8 +326,7 @@ static void release_event(long it) {
 
 static CandEvent g_cand_q[CAND_QUEUE];
 static int g_cand_qn = 0;
-static __thread char g_pi_acc[256];           /* 当前批 PendingInput.match 累积（仅字母） */
-static __thread char g_pi_last[256];          /* 最近一次完整 pendingInputs */
+static __thread char g_pi_last[256];          /* 最近一次完整 pendingInputs 的原始按键 */
 static __thread int g_pi_have = 0;
 static __thread long g_pend_it = 0;           /* 已写入 newIterator、尚未回调的候选 */
 static __thread int g_pend_known = 0;
@@ -557,25 +556,47 @@ static int is_jobj(void *p) {
     if (!p) return 0;
     return ((JObj *)p)->magic == JO_MAGIC;
 }
-/* 引擎在每批候选回调前推送 PendingInput[]，其 match 串拼起来就是本次候选对应的输入。
- * 这里在引擎线程里累积，写 newIterator 时与该 iterator 绑定。 */
+/* 引擎在每批候选回调前推送 PendingInput[]。从完整数组按顺序还原原始按键，
+ * 写 newIterator 时与该 iterator 绑定；不能只拼 match，否则纠错中的删除、
+ * 替换和交换会漏字，当前候选也会被当成旧结果，多等一次 quiet_ms。
+ * PendingExchange 只贡献 left，right 对应的原始按键在后续节点里；插入的
+ * 字母、分隔符、光标和已选文字均不属于当前剩余按键。未知节点或截断不猜测。 */
 static void pending_input_field(const char *name, void *val) {
-    if (!strcmp(name, "match")) {
-        JField *sf = is_jobj(val) ? obj_get((JObj *)val, ".str") : NULL;
-        if (!sf || !sf->val) return;
-        pthread_mutex_lock(&g_cand_mu);
-        size_t n = strlen(g_pi_acc);
-        for (const char *p = sf->val; *p && n + 1 < sizeof g_pi_acc; ++p)
-            if (*p >= 'a' && *p <= 'z') g_pi_acc[n++] = *p;
-        g_pi_acc[n] = 0;
-        pthread_mutex_unlock(&g_cand_mu);
-    } else if (!strcmp(name, "pendingInputs")) {
-        pthread_mutex_lock(&g_cand_mu);
-        memcpy(g_pi_last, g_pi_acc, sizeof g_pi_last);
-        g_pi_acc[0] = 0;
-        g_pi_have = 1;
-        pthread_mutex_unlock(&g_cand_mu);
+    if (strcmp(name, "pendingInputs")) return;
+    char input[sizeof g_pi_last] = "";
+    size_t n = 0;
+    JArr *a = val;
+    int known = a && a->len >= 0 && a->len <= 4096 && (!a->len || a->elem);
+    for (int i = 0; known && i < a->len; ++i) {
+        JObj *o = a->elem[i];
+        if (!is_jobj(o) || !o->cls) { known = 0; break; }
+        const char *kind = strrchr(o->cls, '/');
+        kind = kind ? kind + 1 : o->cls;
+        const char *field;
+        if (!strcmp(kind, "PendingExactlyMatch")) field = "match";
+        else if (!strcmp(kind, "PendingDeletion")) field = "deleted";
+        else if (!strcmp(kind, "PendingReplacement")) field = "from";
+        else if (!strcmp(kind, "PendingExchange")) field = "left";
+        else if (!strcmp(kind, "PendingInsertion") || !strcmp(kind, "PendingSeparator") ||
+                 !strcmp(kind, "PendingInternalCursor") || !strcmp(kind, "PendingSelectedText"))
+            continue;
+        else { known = 0; break; }
+        JField *f = obj_get(o, field);
+        if (!f || f->type != 's' || !f->val) { known = 0; break; }
+        for (const char *p = f->val; *p; ++p) {
+            if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z')) ||
+                n + 1 >= sizeof input) {
+                known = 0;
+                break;
+            }
+            input[n++] = *p;
+        }
     }
+    input[n] = 0;
+    pthread_mutex_lock(&g_cand_mu);
+    memcpy(g_pi_last, input, sizeof g_pi_last);
+    g_pi_have = known;
+    pthread_mutex_unlock(&g_cand_mu);
 }
 static void F_SetObjectField(void *env, void *obj, JIDToken *id, void *val) {
     LOG("SetObjectField(%s.%s)\n", is_jobj(obj) ? ((JObj *)obj)->cls : "?", id ? id->name : "?");
@@ -608,7 +629,6 @@ static void F_SetLongField(void *env, void *obj, JIDToken *id, long v) {
             g_pend_known = g_pi_have;
             memcpy(g_pend_input, g_pi_last, sizeof g_pend_input);
             g_pi_have = 0;
-            g_pi_acc[0] = 0;
             pthread_mutex_unlock(&g_cand_mu);
         }
         printf("*** 捕获 newIterator = %#lx ***\n", (unsigned long)v);
@@ -1164,10 +1184,8 @@ static long daemon_wait_cand(const char *expected, int timeout_ms, int quiet_ms,
     if (!*expected) quiet_ms = 300;  /* unknown-input 路径不受纠错调优影响 */
     long best = 0, last_event = 0;
     int skipped = 0;
-    /* 纠错（乱序/键邻等增广器）会改写引擎的 PendingInput.match（合并/重分段），
-     * 使其与原始键序不再一致——此时精确匹配永远无法命中，若不吃满 timeout
-     * 就只能等。一旦某个已知输入的候选与 expected 不符，改用「回调安静
-     * quiet_ms 即视为当前输入候选已就绪」的判定，避免每键白等 2.5s。 */
+    /* 已知纠错节点已还原原始按键，正常可直接精确匹配。仍保留旧回调或未对齐
+     * 输入的静默回退，避免无法匹配时总是吃满 2.5s；不能为提速直接接受旧结果。 */
     int exact_possible = 1;
     *exact = 0;
     pthread_mutex_lock(&g_cand_mu);
