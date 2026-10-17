@@ -726,7 +726,8 @@ private:
                              ic.capabilityFlags().test(CapabilityFlag::Preedit) &&
                              ic.isPreeditEnabled();
         if (inInput) {
-            preedit.setCursor(static_cast<int>(preedit.textLength()));
+            // 与 Rime 相同：预编辑光标放在开头，使候选框锚定本轮输入起点。
+            preedit.setCursor(0);
             panel.setClientPreedit(preedit);
         } else {
             panel.setPreedit(preedit);
