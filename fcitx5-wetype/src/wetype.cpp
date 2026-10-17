@@ -472,6 +472,19 @@ struct PunctuationState : InputContextProperty {
 struct ModeState : InputContextProperty {
     bool english=false, shiftSolo=false;
     KeySym shiftDown=FcitxKey_None;
+    bool ctrlBPrefix=false;
+    Key prefixKey;
+
+    bool matchesPrefixKey(const Key &key) const {
+        if (!prefixKey.isValid()) return false;
+        // 松开 Shift 后再松开字母时，按键符号可能从 X 变成 x；优先认物理键码。
+        if (prefixKey.code() && key.code()) return prefixKey.code() == key.code();
+        const auto letter = [](KeySym sym) {
+            return sym >= FcitxKey_A && sym <= FcitxKey_Z
+                ? static_cast<KeySym>(sym - FcitxKey_A + FcitxKey_a) : sym;
+        };
+        return letter(prefixKey.sym()) == letter(key.sym());
+    }
 };
 
 // ---------------------------------------------------------------- 主引擎类
@@ -499,7 +512,8 @@ public:
                 const auto symbol=key.key().sym();
                 if (symbol==FcitxKey_Shift_L || symbol==FcitxKey_Shift_R) {
                     if (!key.isRelease()) {
-                        const bool solo=!key.key().states().testAny(KeyStates{KeyState::Ctrl,KeyState::Alt,KeyState::Super,KeyState::Super2,KeyState::Meta,KeyState::Hyper,KeyState::Mod5});
+                        const bool solo=!state->ctrlBPrefix && !state->prefixKey.isValid() &&
+                            !key.key().states().testAny(KeyStates{KeyState::Ctrl,KeyState::Alt,KeyState::Super,KeyState::Super2,KeyState::Meta,KeyState::Hyper,KeyState::Mod5});
                         if (solo && state->shiftDown==FcitxKey_None) { state->shiftDown=symbol;state->shiftSolo=true; }
                         if (solo) key.filter(); // 修饰键仍交给应用，字母大写/组合键照常。
                     } else if (state->shiftDown==symbol) {
@@ -606,6 +620,7 @@ public:
         if (!ic) return;
         auto *mode=ic->propertyFor(&modeFactory_);
         mode->shiftDown=FcitxKey_None;mode->shiftSolo=false;
+        mode->ctrlBPrefix=false;mode->prefixKey=Key();
         bool had = !buf_.empty() || !cands_.empty() || !digitHits_.empty();
         eng_.send("SAVE", nullptr);
         clearAll();
@@ -616,6 +631,8 @@ public:
     void deactivate(const InputMethodEntry &entry, InputContextEvent &event) override {
         auto *ic = event.inputContext();
         if (!ic) return;
+        auto *mode=ic->propertyFor(&modeFactory_);
+        mode->ctrlBPrefix=false;mode->prefixKey=Key();
         // Fcitx calls deactivate before changing the active input method. If
         // Shift (or another IM toggle) is pressed mid-composition, preserve
         // the unfinished pinyin as literal text instead of dropping it.
@@ -666,6 +683,7 @@ private:
         else if (!buf_.empty()) commitText(ic,buf_);
         else clearAll(ic);
         auto *state=ic->propertyFor(&modeFactory_);state->english=!state->english;
+        state->ctrlBPrefix=false;state->prefixKey=Key();
         ic->updateUserInterface(UserInterfaceComponent::StatusArea);
     }
 
@@ -1340,6 +1358,21 @@ void WeTypeEngine::processKey(KeyEvent &event) {
     bool handled = false;
     if (icRef_.get() != ic) clearAll();
     icRef_ = ic->watch();
+    auto *mode = ic->propertyFor(&modeFactory_);
+    // Ctrl+B 是应用的前缀键；后续一个按键（含长按重复及释放）也交给应用。
+    // 修饰键的按下/释放不消耗前缀，因而松开 Ctrl 后的 x 不会进入拼音。
+    if (mode->matchesPrefixKey(event.rawKey())) {
+        if (event.isRelease()) mode->prefixKey = Key();
+        return;
+    }
+    if (!event.isRelease() && !event.key().isModifier()) {
+        if (mode->ctrlBPrefix) {
+            mode->ctrlBPrefix = false;
+            mode->prefixKey = event.rawKey();
+            return;
+        }
+        if (event.key().check(Key(FcitxKey_b, KeyState::Ctrl).normalize())) mode->ctrlBPrefix = true;
+    }
     if (digitPhraseKey(event, ic)) return;
 
     if (pending_) {
